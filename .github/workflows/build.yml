@@ -1,0 +1,449 @@
+name: angle-natives
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      ANGLE_COMMIT: ${{ steps.info.outputs.ANGLE_COMMIT }}
+      VERSION: ${{ steps.info.outputs.VERSION }}
+    steps:
+      - name: Resolve ANGLE HEAD commit + version
+        id: info
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA="$(git ls-remote https://chromium.googlesource.com/angle/angle HEAD | awk '{print $1}')"
+          SHORT="${SHA:0:12}"
+
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            VERSION="${{ github.event.release.tag_name }}"
+          else
+            VERSION="$(date -u +%Y%m%d).${SHORT}"
+          fi
+
+          echo "ANGLE_COMMIT=$SHA" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x64 native
+          - runs_on: ubuntu-latest
+            classifier: natives-linux
+            target_cpu: x64
+            sysroot_arch: amd64
+
+          # Linux arm64 CROSS-BUILD on x64 host
+          - runs_on: ubuntu-latest
+            classifier: natives-linux-arm64
+            target_cpu: arm64
+            sysroot_arch: arm64
+
+          - runs_on: windows-latest
+            classifier: natives-windows
+            target_cpu: x64
+
+          - runs_on: macos-15-intel
+            classifier: natives-macos
+            target_cpu: x64
+
+          - runs_on: macos-latest
+            classifier: natives-macos-arm64
+            target_cpu: arm64
+
+    runs-on: ${{ matrix.runs_on }}
+    env:
+      ANGLE_COMMIT: ${{ needs.resolve.outputs.ANGLE_COMMIT }}
+      CLASSIFIER: ${{ matrix.classifier }}
+      TARGET_CPU: ${{ matrix.target_cpu }}
+      DEPOT_TOOLS_WIN_TOOLCHAIN: "0"
+
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android || true
+          sudo docker image prune -af || true
+          df -h
+
+      - name: Install depot_tools (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
+          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+
+      - name: Install depot_tools (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Add-Content -Path $env:GITHUB_PATH -Value 'C:\Program Files\Git\cmd'
+          $dt = Join-Path $env:USERPROFILE 'depot_tools'
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git $dt
+          Add-Content -Path $env:GITHUB_PATH -Value $dt
+
+      - name: Sync ANGLE + deps (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work/angle
+          cd work/angle
+
+          cat > .gclient <<'EOF'
+          solutions = [
+            {
+              "name": ".",
+              "url": "https://chromium.googlesource.com/angle/angle.git",
+              "deps_file": "DEPS",
+              "managed": False,
+              "custom_vars": {
+                "checkout_angle_cl_deps": False,
+                "checkout_angle_dawn_deps": False,
+                "checkout_angle_internal": False,
+                "checkout_angle_mesa": False,
+                "checkout_angle_restricted_traces": False,
+              },
+            },
+          ]
+          EOF
+
+          gclient sync --no-history -D --force --reset --revision .@"$ANGLE_COMMIT"
+
+      - name: Sync ANGLE + deps (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path 'work\angle' | Out-Null
+          Set-Location 'work\angle'
+
+          @'
+          solutions = [
+            {
+              "name": ".",
+              "url": "https://chromium.googlesource.com/angle/angle.git",
+              "deps_file": "DEPS",
+              "managed": False,
+              "custom_vars": {
+                "checkout_angle_cl_deps": False,
+                "checkout_angle_dawn_deps": False,
+                "checkout_angle_internal": False,
+                "checkout_angle_mesa": False,
+                "checkout_angle_restricted_traces": False,
+              },
+            },
+          ]
+          '@ | Set-Content -Encoding ASCII .gclient
+
+          gclient sync --no-history -D --force --reset --revision .@$env:ANGLE_COMMIT
+
+      - name: Linux build deps
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd work/angle
+          sudo ./build/install-build-deps.sh --no-prompt
+
+      - name: Install Linux sysroot (amd64/arm64)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd work/angle
+          python3 build/linux/sysroot_scripts/install-sysroot.py --arch=${{ matrix.sysroot_arch }}
+
+      - name: Write args.gn + gn gen (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd work/angle
+          mkdir -p out/Release
+
+          {
+            echo 'is_debug = false'
+            echo 'is_component_build = false'
+            echo 'symbol_level = 0'
+            echo "target_cpu = \"${TARGET_CPU}\""
+
+            case "${RUNNER_OS}" in
+              macOS)
+                echo 'angle_enable_metal = true'
+                echo 'angle_enable_vulkan = true'
+                echo 'angle_enable_gl = true'
+                echo 'angle_enable_null = true'
+                ;;
+              Linux)
+                echo 'angle_enable_vulkan = true'
+                echo 'angle_enable_gl = true'
+                echo 'angle_enable_null = true'
+                ;;
+            esac
+          } > out/Release/args.gn
+
+          gn gen out/Release
+
+      - name: Write args.gn + gn gen (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-Location 'work\angle'
+          New-Item -ItemType Directory -Force -Path 'out\Release' | Out-Null
+
+          @"
+          is_debug = false
+          is_component_build = false
+          symbol_level = 0
+          target_cpu = "$env:TARGET_CPU"
+          angle_enable_d3d9 = true
+          angle_enable_d3d11 = true
+          angle_enable_vulkan = true
+          angle_enable_gl = true
+          angle_enable_null = true
+          "@ | Set-Content -Encoding ASCII 'out\Release\args.gn'
+
+          gn gen out/Release
+
+      - name: Build libEGL + libGLESv2 (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd work/angle
+          autoninja -C out/Release libEGL libGLESv2
+
+      - name: Build libEGL + libGLESv2 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-Location 'work\angle'
+          autoninja -C out/Release libEGL libGLESv2
+
+      - name: Stage runtime libs (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd work/angle
+          OUT="$GITHUB_WORKSPACE/dist/${CLASSIFIER}"
+          mkdir -p "$OUT"
+
+          printf "ANGLE_COMMIT=%s\nRUNNER_OS=%s\nTARGET_CPU=%s\n" "$ANGLE_COMMIT" "$RUNNER_OS" "$TARGET_CPU" > "$OUT/ANGLE_BUILD_INFO.txt"
+          cp -f LICENSE "$OUT/" || true
+
+          if [[ "${RUNNER_OS}" == "macOS" ]]; then
+            cp -f out/Release/libEGL.dylib "$OUT/"
+            cp -f out/Release/libGLESv2.dylib "$OUT/"
+          else
+            cp -f out/Release/libEGL.so "$OUT/"
+            cp -f out/Release/libGLESv2.so "$OUT/"
+          fi
+
+      - name: Stage runtime libs (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-Location 'work\angle'
+          $out = Join-Path $env:GITHUB_WORKSPACE ("dist\" + $env:CLASSIFIER)
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          "ANGLE_COMMIT=$env:ANGLE_COMMIT`nRUNNER_OS=Windows`nTARGET_CPU=$env:TARGET_CPU`n" |
+            Set-Content -Encoding ascii (Join-Path $out 'ANGLE_BUILD_INFO.txt')
+
+          if (Test-Path 'LICENSE') { Copy-Item -Force 'LICENSE' $out }
+
+          Copy-Item -Force 'out\Release\libEGL.dll' $out
+          Copy-Item -Force 'out\Release\libGLESv2.dll' $out
+
+          foreach ($f in @('d3dcompiler_47.dll','dxcompiler.dll','dxil.dll')) {
+            $p = Join-Path 'out\Release' $f
+            if (Test-Path $p) { Copy-Item -Force $p $out }
+          }
+
+      - name: Upload staged files
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.classifier }}
+          path: dist/${{ matrix.classifier }}
+          if-no-files-found: error
+
+  package:
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.resolve.outputs.VERSION }}
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Download staged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: angle-artifacts
+
+      - name: Create native/angle all-platform jar
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf bundle maven-jars
+          mkdir -p bundle/native/angle maven-jars
+
+          copy_variant() {
+            local src="$1" os="$2" arch="$3" ext="$4"
+            local dst="bundle/native/angle/${os}/${arch}"
+            mkdir -p "$dst"
+
+            # Core libs (DO NOT rename)
+            cp -f "${src}/libEGL.${ext}"    "${dst}/libEGL.${ext}"
+            cp -f "${src}/libGLESv2.${ext}" "${dst}/libGLESv2.${ext}"
+
+            # Linux: also provide SONAME-style filenames
+            if [[ "$os" == "linux" ]]; then
+              cp -f "${dst}/libEGL.${ext}"    "${dst}/libEGL.${ext}.1"
+              cp -f "${dst}/libGLESv2.${ext}" "${dst}/libGLESv2.${ext}.2"
+            fi
+
+            # Windows: include optional runtime deps if present
+            if [[ "$os" == "windows" ]]; then
+              for f in d3dcompiler_47.dll dxcompiler.dll dxil.dll; do
+                if [[ -f "${src}/${f}" ]]; then cp -f "${src}/${f}" "${dst}/${f}"; fi
+              done
+            fi
+
+            # Info/license (optional)
+            [[ -f "${src}/ANGLE_BUILD_INFO.txt" ]] && cp -f "${src}/ANGLE_BUILD_INFO.txt" "${dst}/"
+            [[ -f "${src}/LICENSE" ]] && cp -f "${src}/LICENSE" "${dst}/LICENSE.ANGLE" || true
+          }
+
+          copy_variant "angle-artifacts/natives-windows"      "windows" "x86_64" "dll"
+          copy_variant "angle-artifacts/natives-linux"        "linux"   "x86_64" "so"
+          copy_variant "angle-artifacts/natives-linux-arm64"  "linux"   "arm64"  "so"
+          copy_variant "angle-artifacts/natives-macos"        "osx"     "x86_64" "dylib"
+          copy_variant "angle-artifacts/natives-macos-arm64"  "osx"     "arm64"  "dylib"
+
+          # Build the all-platform jar (no classifier)
+          jar cf "maven-jars/angle-natives-${VERSION}.jar" -C bundle .
+
+      - name: Create classifier jars (optional)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARTIFACT_ID="angle-natives"
+          for dir in angle-artifacts/*; do
+            cls="$(basename "$dir")"
+            jarname="${ARTIFACT_ID}-${VERSION}-${cls}.jar"
+            jar cf "maven-jars/$jarname" -C "$dir" .
+          done
+
+      - name: Upload Maven jars as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: angle-maven-jars
+          path: maven-jars/*.jar
+          if-no-files-found: error
+
+  publish:
+    needs: [resolve, package]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    env:
+      VERSION: ${{ needs.resolve.outputs.VERSION }}
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Maven
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y maven
+
+      - name: Download Maven jars
+        uses: actions/download-artifact@v4
+        with:
+          name: angle-maven-jars
+          path: maven-jars
+
+      - name: Publish to GitHub Packages (Maven)
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          GROUP_ID="io.github.${GITHUB_REPOSITORY_OWNER}"
+          ARTIFACT_ID="angle-natives"
+          REPO_URL="https://maven.pkg.github.com/${GITHUB_REPOSITORY}"
+
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml <<EOF
+          <settings>
+            <servers>
+              <server>
+                <id>github</id>
+                <username>${GITHUB_ACTOR}</username>
+                <password>${GITHUB_TOKEN}</password>
+              </server>
+            </servers>
+          </settings>
+          EOF
+
+          # 1) Publish the all-platform jar (no classifier)
+          mvn -B deploy:deploy-file \
+            -DrepositoryId=github \
+            -Durl="$REPO_URL" \
+            -DgroupId="$GROUP_ID" \
+            -DartifactId="$ARTIFACT_ID" \
+            -Dversion="$VERSION" \
+            -Dpackaging=jar \
+            -Dfile="maven-jars/${ARTIFACT_ID}-${VERSION}.jar" \
+            -DgeneratePom=true
+
+          # 2) Publish per-classifier jars (with classifier)
+          for jarfile in maven-jars/${ARTIFACT_ID}-${VERSION}-natives-*.jar; do
+            base="$(basename "$jarfile")"
+            cls="${base#${ARTIFACT_ID}-${VERSION}-}"
+            cls="${cls%.jar}"
+
+            mvn -B deploy:deploy-file \
+              -DrepositoryId=github \
+              -Durl="$REPO_URL" \
+              -DgroupId="$GROUP_ID" \
+              -DartifactId="$ARTIFACT_ID" \
+              -Dversion="$VERSION" \
+              -Dpackaging=jar \
+              -Dclassifier="$cls" \
+              -Dfile="$jarfile" \
+              -DgeneratePom=true
+          done
