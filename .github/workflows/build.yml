@@ -223,6 +223,7 @@ jobs:
             echo 'use_sysroot = true'
             echo "target_cpu = \"${TARGET_CPU}\""
             echo 'angle_enable_egl = true'
+            echo 'angle_shared_libvulkan = false'
 
             if [[ "$DEBUG" == "true" ]]; then
               echo 'is_debug = true'
