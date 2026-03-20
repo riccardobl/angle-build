@@ -66,15 +66,12 @@ jobs:
       CLASSIFIER: ${{ matrix.classifier }}
       TARGET_CPU: ${{ matrix.target_cpu }}
       ANGLE_DEBUG: ${{ github.event_name != 'release' }}
+      DEPOT_TOOLS_PYTHON3: python3
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
 
       - name: Install depot_tools
         shell: bash
