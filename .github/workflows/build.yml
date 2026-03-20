@@ -11,9 +11,14 @@ permissions:
   contents: read
   packages: write
 
+env:
+  LINUX_CONTAINER_IMAGE: registry.gitlab.steamos.cloud/steamrt/sniper/sdk
+
 jobs:
   resolve:
     runs-on: ubuntu-latest
+    container:
+      image: registry.gitlab.steamos.cloud/steamrt/sniper/sdk
     outputs:
       ANGLE_COMMIT: ${{ steps.info.outputs.ANGLE_COMMIT }}
       VERSION: ${{ steps.info.outputs.VERSION }}
@@ -28,7 +33,6 @@ jobs:
 
           if [[ "${{ github.event_name }}" == "release" ]]; then
             VERSION="${{ github.event.release.tag_name }}"
-            # Make reruns publishable without 409 conflicts
             if [[ "${GITHUB_RUN_ATTEMPT:-1}" != "1" ]]; then
               VERSION="${VERSION}.r${GITHUB_RUN_ATTEMPT}"
             fi
@@ -39,69 +43,34 @@ jobs:
           echo "ANGLE_COMMIT=$SHA" >> "$GITHUB_OUTPUT"
           echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
 
-  build:
+  build-linux:
     needs: resolve
+    runs-on: ubuntu-latest
+    container:
+      image: registry.gitlab.steamos.cloud/steamrt/sniper/sdk
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runs_on: ubuntu-latest
-            classifier: natives-linux
-            os_dir: linux
+          - classifier: natives-linux
             arch_dir: x86_64
             target_cpu: x64
+            args_file: release-linux-x64.gn
 
-          - runs_on: ubuntu-latest
-            classifier: natives-linux-arm64
-            os_dir: linux
+          - classifier: natives-linux-arm64
             arch_dir: arm64
             target_cpu: arm64
-
-          - runs_on: windows-latest
-            classifier: natives-windows
-            os_dir: windows
-            arch_dir: x86_64
-            target_cpu: x64
-
-          - runs_on: macos-15-intel
-            classifier: natives-macos
-            os_dir: osx
-            arch_dir: x86_64
-            target_cpu: x64
-
-          - runs_on: macos-latest
-            classifier: natives-macos-arm64
-            os_dir: osx
-            arch_dir: arm64
-            target_cpu: arm64
-
-    runs-on: ${{ matrix.runs_on }}
+            args_file: release-linux-arm64.gn
     env:
       ANGLE_COMMIT: ${{ needs.resolve.outputs.ANGLE_COMMIT }}
       CLASSIFIER: ${{ matrix.classifier }}
       TARGET_CPU: ${{ matrix.target_cpu }}
-      DEPOT_TOOLS_WIN_TOOLCHAIN: "0"
       ANGLE_DEBUG: ${{ github.event_name != 'release' }}
-
     steps:
-
-    
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Prepare linux
-        if: runner.os == 'Linux'
-        shell: bash
-        env: 
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          set -euo pipefail
-          rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android || true
-          sudo apt update
-          sudo apt install git curl build-essential python3 lsb-release file sudo -y
-          df -h
 
       - uses: actions/setup-python@v5
         with:
@@ -113,39 +82,133 @@ jobs:
           set -euo pipefail
           git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
           echo "$HOME/depot_tools" >> "$GITHUB_PATH"
-          export PATH="$HOME/depot_tools:$PATH"
 
-      - name: set depot_tools on windows path
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: | 
-          Add-Content -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\depot_tools"
-
-     
-
-      - name: Prepare ANGLE 
+      - name: Prepare ANGLE
         shell: bash
-        if: runner.os == 'Linux' || runner.os == 'macOS'
-        env:
-          ARCH: ${{ matrix.target_cpu }}
-          OS: ${{ matrix.os_dir }}
         run: |
           set -euo pipefail
+          export PATH="$HOME/depot_tools:$PATH"
+
           mkdir -p angle
           cd angle
           fetch angle
-          if [ "$OS" == "linux" ]; then
-            ./build/install-build-deps.sh --no-prompt
-            if [ "$ARCH" == "arm64" ]; then
-              python3 build/linux/sysroot_scripts/install-sysroot.py --arch=${{ matrix.target_cpu }}
-            fi
+
+          if git apply --check ../patches/0001-linux-prefer-vulkan-default-display.patch; then
+            git apply ../patches/0001-linux-prefer-vulkan-default-display.patch
           fi
+
+          if [ "$TARGET_CPU" = "arm64" ]; then
+            python3 build/linux/sysroot_scripts/install-sysroot.py --arch=arm64
+          fi
+
           mkdir -p out/Release
-          configFile="release-${{ matrix.os_dir }}-${{ matrix.target_cpu }}.gn"
-          cp ../$configFile out/Release/args.gn
+          cp "../${{ matrix.args_file }}" out/Release/args.gn
           gn gen out/Release
 
-      - name: Prepare ANGLE 
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/depot_tools:$PATH"
+          cd angle
+          autoninja -C out/Release libEGL libGLESv2
+
+      - name: Stage runtime libs into native/angle/...
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd angle
+
+          OUT="$GITHUB_WORKSPACE/dist/${CLASSIFIER}/native/angle/linux/${{ matrix.arch_dir }}"
+          mkdir -p "$OUT"
+
+          printf "ANGLE_COMMIT=%s\nRUNNER_OS=%s\nTARGET_CPU=%s\nANGLE_DEBUG=%s\n" \
+            "$ANGLE_COMMIT" "$RUNNER_OS" "$TARGET_CPU" "$ANGLE_DEBUG" > "$OUT/ANGLE_BUILD_INFO.txt"
+
+          cp -f LICENSE "$OUT/LICENSE.ANGLE" || true
+          cp -f out/Release/libEGL.* "$OUT/"
+          cp -f out/Release/libGLESv2.* "$OUT/"
+          rm -Rf "$OUT/"*.TOC || true
+
+      - name: Upload staged files
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.classifier }}
+          path: dist/${{ matrix.classifier }}
+          if-no-files-found: error
+
+  build-nonlinux:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs_on: windows-latest
+            classifier: natives-windows
+            runtime_os_dir: windows
+            arch_dir: x86_64
+            target_cpu: x64
+            args_file: release-windows-x64.gn
+
+          - runs_on: macos-15-intel
+            classifier: natives-macos
+            runtime_os_dir: osx
+            arch_dir: x86_64
+            target_cpu: x64
+            args_file: release-osx-x64.gn
+
+          - runs_on: macos-latest
+            classifier: natives-macos-arm64
+            runtime_os_dir: osx
+            arch_dir: arm64
+            target_cpu: arm64
+            args_file: release-osx-arm64.gn
+    runs-on: ${{ matrix.runs_on }}
+    env:
+      ANGLE_COMMIT: ${{ needs.resolve.outputs.ANGLE_COMMIT }}
+      CLASSIFIER: ${{ matrix.classifier }}
+      TARGET_CPU: ${{ matrix.target_cpu }}
+      DEPOT_TOOLS_WIN_TOOLCHAIN: "0"
+      ANGLE_DEBUG: ${{ github.event_name != 'release' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install depot_tools
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
+          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+
+      - name: Install depot_tools
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$env:USERPROFILE\depot_tools"
+          Add-Content -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\depot_tools"
+
+      - name: Prepare ANGLE
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/depot_tools:$PATH"
+          mkdir -p angle
+          cd angle
+          fetch angle
+          mkdir -p out/Release
+          cp "../${{ matrix.args_file }}" out/Release/args.gn
+          gn gen out/Release
+
+      - name: Prepare ANGLE
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -154,39 +217,34 @@ jobs:
           Set-Location -Path angle
           fetch angle
           New-Item -ItemType Directory -Path out/Release
-          $configFile="release-${{ matrix.os_dir }}-${{ matrix.target_cpu }}.gn"
-          Copy-Item -Path "../$configFile" -Destination "out/Release/args.gn"
+          Copy-Item -Path "../${{ matrix.args_file }}" -Destination "out/Release/args.gn"
           gn gen out/Release
- 
 
-      - name: "Build"
+      - name: Build
         shell: bash
         run: |
           set -euo pipefail
           cd angle
           autoninja -C out/Release libEGL libGLESv2
- 
+
       - name: Stage runtime libs into native/angle/...
         shell: bash
         run: |
           set -euo pipefail
           cd angle
 
-          OS_DIR="${{ matrix.os_dir }}"
-          ARCH_DIR="${{ matrix.arch_dir }}"
-          OUT="$GITHUB_WORKSPACE/dist/${CLASSIFIER}/native/angle/${OS_DIR}/${ARCH_DIR}"
+          OUT="$GITHUB_WORKSPACE/dist/${CLASSIFIER}/native/angle/${{ matrix.runtime_os_dir }}/${{ matrix.arch_dir }}"
           mkdir -p "$OUT"
 
           printf "ANGLE_COMMIT=%s\nRUNNER_OS=%s\nTARGET_CPU=%s\nANGLE_DEBUG=%s\n" \
             "$ANGLE_COMMIT" "$RUNNER_OS" "$TARGET_CPU" "$ANGLE_DEBUG" > "$OUT/ANGLE_BUILD_INFO.txt"
-            
-          cp -f LICENSE "$OUT/LICENSE.ANGLE" || true
 
-          cp -f out/Release/libEGL.*    "$OUT/"
+          cp -f LICENSE "$OUT/LICENSE.ANGLE" || true
+          cp -f out/Release/libEGL.* "$OUT/"
           cp -f out/Release/libGLESv2.* "$OUT/"
           cp -f out/Release/d3dcompiler* "$OUT/" || true
-          cp -f out/Release/dxcompiler*   "$OUT/" || true
-          cp -f out/Release/dxil*         "$OUT/" || true
+          cp -f out/Release/dxcompiler* "$OUT/" || true
+          cp -f out/Release/dxil* "$OUT/" || true
           rm -Rf "$OUT/"*.TOC || true
 
       - name: Upload staged files
@@ -197,11 +255,15 @@ jobs:
           if-no-files-found: error
 
   package:
-    needs: [resolve, build]
+    needs: [resolve, build-linux, build-nonlinux]
     runs-on: ubuntu-latest
+    container:
+      image: registry.gitlab.steamos.cloud/steamrt/sniper/sdk
     env:
       VERSION: ${{ needs.resolve.outputs.VERSION }}
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -212,38 +274,28 @@ jobs:
         with:
           path: angle-artifacts
 
-      - name: Create jars (all-platform + per-classifier)
+      - name: Create jars in dist/
         shell: bash
+        env:
+          PACKAGE_INPUT_DIR: angle-artifacts
+          PACKAGE_OUTPUT_DIR: dist
         run: |
           set -euo pipefail
-          rm -rf maven-jars bundle
-          mkdir -p maven-jars bundle
+          chmod +x ./package.sh
+          ./package.sh "$VERSION"
 
-          # Merge all classifier artifacts into one folder (paths won't collide)
-          for d in angle-artifacts/*; do
-            rsync -a "$d/" bundle/
-          done
-
-          # All-platform jar (no classifier)
-          jar cf "maven-jars/angle-natives-${VERSION}.jar" -C bundle .
-
-          # Per-classifier jars
-          ARTIFACT_ID="angle-natives"
-          for d in angle-artifacts/*; do
-            cls="$(basename "$d")"
-            jar cf "maven-jars/${ARTIFACT_ID}-${VERSION}-${cls}.jar" -C "$d" .
-          done
-
-      - name: Upload Maven jars as artifact
+      - name: Upload packaged jars
         uses: actions/upload-artifact@v4
         with:
           name: angle-maven-jars
-          path: maven-jars/*.jar
+          path: dist/*.jar
           if-no-files-found: error
 
   publish:
     needs: [resolve, package]
     runs-on: ubuntu-latest
+    container:
+      image: registry.gitlab.steamos.cloud/steamrt/sniper/sdk
     if: github.event_name == 'release'
     env:
       VERSION: ${{ needs.resolve.outputs.VERSION }}
@@ -257,14 +309,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y maven
+          if command -v apt-get >/dev/null 2>&1; then
+            apt-get update
+            apt-get install -y maven
+          elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y maven
+          else
+            echo "No supported package manager found to install Maven" >&2
+            exit 1
+          fi
 
       - name: Download Maven jars
         uses: actions/download-artifact@v4
         with:
           name: angle-maven-jars
-          path: maven-jars
+          path: dist
 
       - name: Publish to GitHub Packages (Maven) - single deploy to avoid 409
         shell: bash
@@ -290,13 +349,12 @@ jobs:
           </settings>
           EOF
 
-          MAIN="maven-jars/${ARTIFACT_ID}-${VERSION}.jar"
+          MAIN="dist/${ARTIFACT_ID}-${VERSION}.jar"
           if [[ ! -f "$MAIN" ]]; then
             echo "Missing main jar: $MAIN" >&2
             exit 1
           fi
 
-          # Build a single POM once
           POM="$(mktemp)"
           cat > "$POM" <<EOF
           <project xmlns="http://maven.apache.org/POM/4.0.0"
@@ -310,11 +368,9 @@ jobs:
           </project>
           EOF
 
-          # Collect classifier jars
-          mapfile -t EXTRAS < <(ls -1 "maven-jars/${ARTIFACT_ID}-${VERSION}-natives-"*.jar 2>/dev/null || true)
+          mapfile -t EXTRAS < <(ls -1 "dist/${ARTIFACT_ID}-${VERSION}-natives-"*.jar 2>/dev/null || true)
 
           if (( ${#EXTRAS[@]} == 0 )); then
-            # Only main jar
             mvn -B deploy:deploy-file \
               -DrepositoryId=github \
               -Durl="$REPO_URL" \
@@ -328,7 +384,6 @@ jobs:
             exit 0
           fi
 
-          # Build comma-separated lists for the plugin
           FILES=""
           CLASSIFIERS=""
           TYPES=""
@@ -347,7 +402,6 @@ jobs:
           CLASSIFIERS="${CLASSIFIERS%,}"
           TYPES="${TYPES%,}"
 
-          # Deploy everything in ONE request: main jar + attached classifier jars
           mvn -B deploy:deploy-file \
             -DrepositoryId=github \
             -Durl="$REPO_URL" \
