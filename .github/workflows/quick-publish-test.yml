@@ -1,0 +1,61 @@
+name: angle-natives-quick-publish-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      quick_version:
+        description: "Optional version override for the quick publish test"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  quick-publish-test:
+    runs-on: ubuntu-latest
+    container:
+      image: registry.gitlab.steamos.cloud/steamrt/sniper/sdk
+    permissions:
+      contents: read
+      packages: write
+    env:
+      MAVEN_USERNAME: ${{ secrets.GH_PACKAGES_USERNAME || github.actor }}
+      MAVEN_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN || github.token }}
+      QUICK_VERSION: ${{ github.event.inputs.quick_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Create empty test jars
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x .github/scripts/create-empty-jars.sh
+          .github/scripts/create-empty-jars.sh
+
+      - name: Resolve publish environment
+        shell: bash
+        env:
+          FORCE_DISABLE_SONATYPE: "true"
+        run: |
+          set -euo pipefail
+          chmod +x .github/scripts/resolve-publish-env.sh
+          .github/scripts/resolve-publish-env.sh
+
+      - name: Publish test jars to GitHub Packages with Gradle
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle --no-daemon -p .github/gradle publishArtifacts
