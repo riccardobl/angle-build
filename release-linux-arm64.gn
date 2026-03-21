@@ -13,3 +13,4 @@ angle_enable_gl = false
 angle_enable_null = false
 angle_shared_libvulkan = false
 use_sysroot = true
+symbol_level = 0
