@@ -294,13 +294,21 @@ jobs:
     container:
       image: registry.gitlab.steamos.cloud/steamrt/sniper/sdk
     if: github.event_name == 'release'
+    permissions:
+      contents: read
+      packages: write
     env:
       VERSION: ${{ needs.resolve.outputs.VERSION }}
+      MAVEN_USERNAME: ${{ secrets.GH_PACKAGES_USERNAME || github.actor }}
+      MAVEN_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "21"
+          server-id: github
+          server-username: MAVEN_USERNAME
+          server-password: MAVEN_TOKEN
 
       - name: Install Maven
         shell: bash
@@ -324,27 +332,20 @@ jobs:
 
       - name: Publish to GitHub Packages (Maven) - single deploy to avoid 409
         shell: bash
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
+          OWNER_LC="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+
           GROUP_ID="io.github.${GITHUB_REPOSITORY_OWNER}"
           ARTIFACT_ID="angle-natives"
-          REPO_URL="https://maven.pkg.github.com/${GITHUB_REPOSITORY}"
+          REPO_URL="https://maven.pkg.github.com/${OWNER_LC}/${REPO_NAME}"
 
-          mkdir -p ~/.m2
-          cat > ~/.m2/settings.xml <<EOF
-          <settings>
-            <servers>
-              <server>
-                <id>github</id>
-                <username>${GITHUB_ACTOR}</username>
-                <password>${GITHUB_TOKEN}</password>
-              </server>
-            </servers>
-          </settings>
-          EOF
+          if [[ -z "${MAVEN_TOKEN:-}" ]]; then
+            echo "Missing Maven/GitHub Packages token. Configure GH_PACKAGES_TOKEN or use GITHUB_TOKEN." >&2
+            exit 1
+          fi
 
           MAIN="dist/${ARTIFACT_ID}-${VERSION}.jar"
           if [[ ! -f "$MAIN" ]]; then
